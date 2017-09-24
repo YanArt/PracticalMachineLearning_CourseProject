@@ -1,0 +1,269 @@
+---
+title: "Practical Machine Learning - Course Project"
+author: "Yanchenko Artem"
+output:
+  html_document: default
+  html_notebook: default
+---
+
+```{r, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(caret)
+
+```
+
+## The task  
+Classify weightlifting activity according to one of 5 predefined classes of such activity.  
+
+## The data  
+The data was collected from accelerometers attached to the belt, forearm, arm, and dumbell of 6 participants. They were asked to perform one set of 10 repetitions of the Unilateral Dumbbell Biceps Curl in 5 different ways. Class A corresponds to the specified execution of the exercise, while the other 4 classes correspond to common mistakes: throwing the elbows to the front (Class B), lifting the dumbbell only halfway (Class C), lowering the dumbbell only halfway (Class D) and throwing the hips to the front (Class E).  
+The data has already been split into training and testing sets.  
+
+```{r, eval=FALSE}
+train_url <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+test_url <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+download.file(train_url, "pml-training.csv")
+download.file(test_url, "pml-testing.csv")
+```
+
+We read the datasets in.
+```{r}
+train_org <- read.csv("pml-training.csv", stringsAsFactors = FALSE, na.strings = c("", "NA"))
+test_org <- read.csv("pml-testing.csv", stringsAsFactors = FALSE, na.strings = c("", "NA"))
+```
+
+## Explore the data  
+To avoid treating the test set as the train set and overfitting the model, we only conduct exploratory analysis and model training on the training set.  
+```{r}
+str(train_org[,1:15])
+```
+
+There are character variables with "NA". They should be converted to numerical type and removed, if percentage of NAs is too high.  
+Classes of exercise execution mode are coded in `classe` variable.  
+```{r}
+table(train_org$classe)
+```
+
+Summary of first few numerical variables.  
+```{r}
+summary(train_org[,c(1,3,4,7:11)])
+```
+
+Magnitudes of numerical sensor recorded values differ too much. It would make sense to normalize them and apply log transformation, which doesn't change order of the data.  
+We have 6 participants, whos' names are in `user_name` variable.  
+```{r}
+table(train_org$user_name)
+```
+
+Since all participants were given the same task, we would expect that number of entries for each participant to be the same, but they range from `r range(table(factor(train_org[,2])))[1]` to `r range(table(factor(train_org[,2])))[2]`.   
+Each entry (observation) in fact is a measurement taken every fraction of second during activity execution.  
+
+There are 3 variables covering time attribute of the study. These are important variables, because all measurements were collected over the time of performing an activity, which makes the data time series data effectively.  
+```{r}
+act_time_range <- c(adelmo = range(train_org$cvtd_timestamp[train_org$user_name == "adelmo"]),
+            carlitos = range(train_org$cvtd_timestamp[train_org$user_name == "carlitos"]),
+            charles = range(train_org$cvtd_timestamp[train_org$user_name == "charles"]),
+            eurico = range(train_org$cvtd_timestamp[train_org$user_name == "eurico"]),
+            jeremy = range(train_org$cvtd_timestamp[train_org$user_name == "jeremy"]),
+            pedro = range(train_org$cvtd_timestamp[train_org$user_name == "pedro"]))
+act_time_range
+```
+
+Looks like it took every participant about 2-3 minutes to perform all 50 repetitions (5 sets of 10 repetitions). So they must have performed them back-to-back, without rest.  
+I would have treated this data as time series data, but the final goal of this project is to predict activity mode for 20 observations sampled from the original dataset. Each such observation corresponds to a moment in time, not a full repetition.  
+It looks like one set of repetitions lasts roughly 20 to 25 units of `raw_timestamp_part_1` on average.  
+But `raw_timestamp_part_2` represents much more precise time scale.  
+
+In this dataset we have 3 different timescales: `raw_timestamp_part_1`, `raw_timestamp_part_2` and `cvtd_timestamp`.  
+`raw_timestamp_part_1` represents continuous real time, `cvtd_timestamp` - carries the same information as the previous variable converted to POSIXt format, `raw_timestamp_part_2` - represents local timescale of each activity mode (in milliseconds). The `raw_timestamp_part_2` variable can be useful for prediction in case if participants performed modes of the activity in the same order, but we don't know that.  
+These are important variables, but given the nature of the task, I think it makes sense to drop them altogether.  
+Imagine a classifier that would split the data based on the certain value of `raw_timestamp_part_1`. Such a split would be irrelevant for a different participant, who performed the activity on different day and time.  
+
+## Missing values  
+Many machine learning algorithms are sensitive to missing values, so they should be taken care of.  
+```{r, message=FALSE, warning=FALSE}
+train_org <- train_org %>% mutate_at(c(12:159), as.numeric)
+train_org <- train_org %>% mutate_at(c(2, 5, 6, 160), factor)
+na_vars <- apply(train_org, 2, function(x) {sum(is.na(x))})
+```
+
+There are `r sum(na_vars > nrow(train_org)*0.5)` variables that have more than 50% of NAs.  
+It makes sense to remove such variables from the data set.  
+```{r}
+train_cln <- train_org[,-c(which(na_vars > (nrow(train_org)/2)))]
+cat("Number of NAs left in the data set now is", sum(is.na(train_cln)))
+```
+
+## Preprocessig
+We will use `caret` package to build and tune the model.  
+First, we normalize numeric variables and transform them, so all values are within the range of 0 to 1.  
+```{r}
+prepr_obj <- preProcess(train_cln, method=c("YeoJohnson", "range"))
+train_cln <- predict(prepr_obj, train_cln)
+```
+
+## Checking for near zero covariates  
+Here, we identify near zero covariate variables and remove them.  
+```{r}
+nzv <- nearZeroVar(train_cln)
+cat("Near zero covariates found:", names(train_cln[nzv]))
+```
+```{r}
+train_cln <- train_cln[,-nzv]
+```
+
+## Dealing with factor variables  
+There is only 1 factor variable (except for the outcome) left in the data set and we'll dummy it since it has just 6 unique values.  
+```{r, message=FALSE, warning=FALSE}
+dum_vars <- dummyVars(classe ~ user_name, data=train_cln, fullRank = FALSE)
+dummies <- data.frame(predict(dum_vars, newdata=train_cln))
+```
+
+## Assembling model ready dataset  
+```{r}
+train_mdr <- cbind(dummies, train_cln[,c(6:59)])
+```
+
+## Preprocess test set  
+To make the test set ready for model evaluation we need to preprocess it the same way we have the train set.  
+```{r}
+test_cln <- test_org %>% mutate_at(c(12:159), as.numeric)
+test_cln <- test_org %>% mutate_at(c(2, 5, 6, 160), factor)
+na_vars2 <- apply(test_cln, 2, function(x) {sum(is.na(x))})
+test_cln <- test_cln[,-c(which(na_vars2 > (nrow(test_cln)/2)))]
+test_cln <- predict(prepr_obj, test_cln)
+nzv2 <- nearZeroVar(test_cln)
+test_cln <- test_cln[,-nzv2]
+dum_vars2 <- dummyVars( ~ user_name, data=test_cln, fullRank = FALSE)
+dummies2 <- data.frame(predict(dum_vars2, newdata=test_cln))
+test_mdr <- cbind(dummies2, test_cln[,c(6:59)])
+```
+
+## Split data - create validation set
+Since training set is quite large, we can afford to set part of the data aside for model validation.  
+This will allow us to get an unbiased estimation of out-of-sample error.  
+```{r}
+train_indx <- createDataPartition(train_mdr$classe, times = 1, p=0.75, list = FALSE)
+train_set <- train_mdr[train_indx,]
+valid_set <- train_mdr[-train_indx,]
+```
+
+## Feature selection  
+Even after preprocessing the dataset still has `r length(predictors)` predictors. With the number of observations close to 20000 model evaluation can become quite computationaly demanding.  
+To avoid that it makes sense to try to reduce the number of predictors.  
+```{r}
+control_rfe <- rfeControl(functions = rfFuncs, method = "repeatedcv", repeats = 3, verbose = FALSE)
+outcome_name <- "classe"
+predictors <- names(train_set)[!names(train_set) %in% outcome_name]
+pred_prof <- rfe(train_set[,predictors], train_set[,outcome_name], rfeControl = control_rfe)
+pred_prof
+```
+
+As a result we have a short set of 4 predictors that achive 99.9% accuracy on the "training" set.  
+```{r}
+short_list <- c("num_window", "roll_belt", "yaw_belt", "magnet_dumbbell_z")
+```
+
+## Train a model  
+Since the outcome variable `classe` is a categorical variable we have a classification problem.  
+We also don't know how linear the relation between the outcome and predictors is.  
+The above limits our choice of appropriate algorithms to:  
+- decision tries (method = "RPART")  
+- random forest (method = "RF")  
+- gradient boosting model (method = "GBM")  
+We start by creating control objects and tuneGrids to use with `train()` function for every method we use.  
+To have a better estimate of the "out-of-sample" error we employ "random subsampling" cross validation technique. We choose this over k-fold or leave-one-out cross validation because of the nature of the data.  
+Tuning parameters for these methods are:  
+RPART - `cp`;  
+RF - `mtry`;  
+GBM - `n.trees`, `interaction.depth`, `shrinkage` and `n.minobsinnode`.  
+
+```{r}
+fitControl <- trainControl(method = "cv", number = 3)
+tune_grid_rpart <- expand.grid(cp=c(0.01,0.05,0.1))
+tune_grid_rf <- expand.grid(mtry=c(2, 3, 4))
+tune_grid_gbm <- expand.grid(n.trees=c(20,50,100), shrinkage=c(0.01,0.08,0.5), n.minobsinnode = c(100,200,500),interaction.depth=c(1,3,6))
+```
+
+### Decision tree  
+We start by fitting CART (classification and regression tree) model.  
+```{r, cache=TRUE, fig.width=8}
+set.seed(1975)
+trn_cart <- train(train_set[,short_list], train_set[,60], method="rpart", trControl = fitControl, 
+                   tuneGrid = tune_grid_rpart)
+cat("In-sample accuracy of this model is", trn_cart$results$Accuracy[1], ", Kappa is", trn_cart$results$Kappa[1])
+plot(trn_cart)
+```
+
+Now we evaluate model performance by predicting on the "validation" set.  
+This way we can get an estimate of the out-of-sample error rate, because "validation" set was not a part of data we used to train the model.  
+```{r}
+pred_cart_val <- predict(trn_cart, valid_set[,-60], type = "raw")
+confusionMatrix(pred_cart_val, valid_set[,60])
+```
+Accuracy of this model on "validation" is 86.77%, which is understandably less than "in-sample" accuracy.  
+Finally, we predict on the "test" set.  
+```{r}
+prd_cart_test <- predict(trn_cart, test_mdr[,-60], type = "raw")
+prd_cart_test
+```
+
+## Random forest
+```{r, cache=TRUE, message=FALSE, fig.width=8}
+set.seed(1975)
+trn_rf <- train(train_set[,short_list], train_set[,60], method = "rf", trControl = fitControl, 
+                  tuneGrid = tune_grid_rf)
+cat("In-sample accuracy of this model is", trn_rf$results$Accuracy[1], ", Kappa is", trn_rf$results$Kappa[1])
+plot(trn_rf)
+```
+Now we evaluate model performance by predicting on the "validation" set to get an estimation of out-of-sample error.  
+```{r}
+pred_rf_val <- predict(trn_rf, valid_set[,-60], type = "raw")
+confusionMatrix(pred_rf_val, valid_set[,60])
+```
+This model achieved almost perfect accuracy of 99.78% on "validation" set.  
+Now, we predict on the "test" set.  
+```{r}
+prd_rf_test <- predict(trn_rf, test_mdr[,-60], type = "raw")
+prd_rf_test
+```
+
+### Generalized Boosting Model
+```{r, cache=TRUE, warning=FALSE, message=FALSE, fig.width=8}
+set.seed(1975)
+trn_gbm <- train(train_set[,short_list], train_set[,60], method = "gbm", verbose = FALSE, trControl = fitControl, 
+                  tuneGrid = tune_grid_gbm)
+cat("In-sample accuracy of this model is", round(trn_gbm$results$Accuracy[which.max(trn_gbm$results$Accuracy)], 4), 
+    ", Kappa is", round(trn_gbm$results$Kappa[which.max(trn_gbm$results$Kappa)], 4))
+plot(trn_gbm)
+```
+Now we evaluate model performance by predicting on the "validation" set.  
+```{r}
+pred_gbm_val <- predict(trn_gbm, valid_set[,-60], type = "raw")
+confusionMatrix(pred_gbm_val, valid_set[,60])
+```
+Out-of-sample accuracy of this model is 99.98% (on "validation" set).  
+```{r}
+prd_gbm_test <- predict(trn_gbm, test_mdr[,-60], type = "raw")
+prd_gbm_test
+```
+
+## Final prediction on the test set
+Classes of "test" set observations predicted by "RF" and "GBM" models are in perfect agreement. "Rpart" method has also produced very similar predictions with just a few differences.  
+Still, I'd like to formally combine predictions of the models built above and make them vote for the final predictions.  
+First, we combine all predictions in a data frame.  
+```{r}
+predictions_test <- data.frame(rbind(problem_id = test_org$problem_id, CART_pred = as.character(prd_cart_test), RF_pred = as.character(prd_rf_test), GBM_pred = as.character(prd_gbm_test), final_pred = NA))
+```
+Now, we pick the most common prediction for every "test" observation.  
+```{r}
+for (i in 1:ncol(predictions_test)) {
+      fp <- names(which.max(table(predictions_test[2:4,i])))
+      predictions_test[5,i] <- fp
+}
+predictions_test[c(1,5),]
+```
+
+
+
+
